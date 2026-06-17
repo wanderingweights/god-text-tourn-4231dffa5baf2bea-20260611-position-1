@@ -31,6 +31,7 @@ import bitsandbytes as bnb
 from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 import yaml
 from state_manager import get_state, set_state
+import quasar_loader
 
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", "0"))
 
@@ -101,28 +102,33 @@ def print_trainable_parameters(model):
     
 
 def load_lora_model(training_args: TrainingArguments, model_path: str, lora_args: LoraArguments, token_nums: int):
-    if training_args.use_liger:
-        from liger_kernel.transformers import AutoLigerKernelForCausalLM
-        model_class = AutoLigerKernelForCausalLM
+    if quasar_loader.is_quasar(model_path):
+        # QuasarLong needs sdpa (hybrid branches) + raven/fla on path + meta fill.
+        # q_lora/liger are not supported for this custom arch.
+        model = quasar_loader.load_quasar_model(model_path)
     else:
-        model_class = transformers.AutoModelForCausalLM
+        if training_args.use_liger:
+            from liger_kernel.transformers import AutoLigerKernelForCausalLM
+            model_class = AutoLigerKernelForCausalLM
+        else:
+            model_class = transformers.AutoModelForCausalLM
 
-    model = model_class.from_pretrained(
-        model_path,
-        attn_implementation="flash_attention_2" if not training_args.disable_fa else "eager",
-        torch_dtype=torch.bfloat16,
-        quantization_config=(
-            BitsAndBytesConfig(
-                load_in_4bit=True,
-                bnb_4bit_use_double_quant=True,
-                bnb_4bit_quant_type="nf4",
-                attn_implementation="flash_attention_2" if not training_args.disable_fa else "eager",
-                bnb_4bit_compute_dtype=torch.bfloat16,
-            )
-            if lora_args.q_lora
-            else None
-        ),
-    )
+        model = model_class.from_pretrained(
+            model_path,
+            attn_implementation="flash_attention_2" if not training_args.disable_fa else "eager",
+            torch_dtype=torch.bfloat16,
+            quantization_config=(
+                BitsAndBytesConfig(
+                    load_in_4bit=True,
+                    bnb_4bit_use_double_quant=True,
+                    bnb_4bit_quant_type="nf4",
+                    attn_implementation="flash_attention_2" if not training_args.disable_fa else "eager",
+                    bnb_4bit_compute_dtype=torch.bfloat16,
+                )
+                if lora_args.q_lora
+                else None
+            ),
+        )
     # do not resize tokem embeddings in LOra --> will encounter size mismatch error in evaluation 
     # model.resize_token_embeddings(token_nums)
     # convert to lora
@@ -162,8 +168,11 @@ def load_lora_model(training_args: TrainingArguments, model_path: str, lora_args
 
 
 def load_model(training_args: TrainingArguments, model_path: str, token_nums: int):
+    if quasar_loader.is_quasar(model_path):
+        return quasar_loader.load_quasar_model(model_path)
+
     model_class = transformers.AutoModelForCausalLM
-    
+
     if training_args.use_liger:
         from liger_kernel.transformers import AutoLigerKernelForCausalLM
 
@@ -220,8 +229,18 @@ def main():
     if use_kl:
         log_info(f"[sn56][kl] USE_KL=1, kl_coef={kl_coef} — termo KL ativo")
 
-    from model_utility import load_tokenizer
-    tokenizer = load_tokenizer(train_request["model_path"])
+    is_quasar = quasar_loader.is_quasar(train_request["model_path"])
+    if is_quasar:
+        # Custom tokenizer (AutoTokenizer can't parse its TokenizersBackend
+        # config) and make fla/raven importable before any model load.
+        quasar_loader.prepare(train_request["model_path"])
+        tokenizer = quasar_loader.load_tokenizer(train_request["model_path"])
+        # Hybrid linear-attention branches are incompatible with FA sample
+        # packing; train unpacked.
+        training_args.packing = False
+    else:
+        from model_utility import load_tokenizer
+        tokenizer = load_tokenizer(train_request["model_path"])
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     

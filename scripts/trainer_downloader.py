@@ -120,12 +120,40 @@ async def download_base_model(repo_id: str, save_root: str) -> str:
             return save_path
 
 
+def _ensure_quasar_raven(model_dir: str) -> None:
+    """QuasarLong needs a repo-local raven/ package for its hybrid layers, which
+    is NOT published on the silx-ai/Quasar-Preview HF repo. Fetch it from
+    eyad-silx/raven into the model dir so `import raven` resolves."""
+    cfg_path = os.path.join(model_dir, "config.json")
+    if not os.path.exists(cfg_path):
+        return
+    try:
+        with open(cfg_path) as f:
+            archs = json.load(f).get("architectures") or []
+    except Exception:
+        return
+    if not any("quasarlong" in str(a).lower() for a in archs):
+        return
+    if os.path.isdir(os.path.join(model_dir, "raven")):
+        return
+    print(f"[quasar] fetching raven package into {model_dir}", flush=True)
+    snapshot_download(
+        repo_id="eyad-silx/raven",
+        repo_type="model",
+        local_dir=model_dir,
+        local_dir_use_symlinks=False,
+        allow_patterns=["raven/**"],
+    )
+
+
 async def download_axolotl_base_model(repo_id: str, save_dir: str) -> str:
     model_dir = os.path.join(save_dir, repo_id.replace("/", "--"))
     if os.path.exists(model_dir):
         print(f"Model {repo_id} already exists at {model_dir}. Skipping download.")
+        _ensure_quasar_raven(model_dir)
         return model_dir
     snapshot_download(repo_id=repo_id, repo_type="model", local_dir=model_dir, local_dir_use_symlinks=False)
+    _ensure_quasar_raven(model_dir)
     return model_dir
 
 

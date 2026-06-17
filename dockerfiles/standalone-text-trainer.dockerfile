@@ -36,14 +36,23 @@ RUN bash -c "source /workspace/axo_py/bin/activate && \
 
 
 # install the main dependencies
+# NOTE: bumped to torch 2.7.1 / transformers 5.12.1 / triton 3.3.1 to support
+# custom hybrid-attention checkpoints (e.g. silx-ai/Quasar-Preview), whose
+# vendored fla kernels require torch>=2.5 (torch.distributed.tensor public API)
+# and whose modeling code is authored against transformers v5.
+# torch is installed FIRST so flash-attn compiles against 2.7.
 RUN pip install uv && \
     pip install -U packaging==23.2 setuptools==75.8.0 wheel ninja && \
+    pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu126 && \
     uv pip install -r /workspace/scripts/training_requirements.txt --system && \
     pip install hf_transfer==0.1.9 && \
     pip install tenacity==9.1.2 && \
     pip install tiktoken==0.9.0 && \
     pip install flash-attn==v2.7.4.post1 --no-build-isolation && \
-    uv pip install vllm==0.8.3 --system && \
     pip install "fiber @ git+https://github.com/rayonlabs/fiber.git@2.4.0"
+# vLLM (GRPO rollouts only) is intentionally NOT installed here: vllm==0.8.3
+# pins torch 2.4 and conflicts with the torch 2.7 bump above. GRPO support on
+# the bumped stack needs a torch-2.7-compatible vllm (>=0.10) and is a separate
+# follow-up; the instruct/DPO training paths do not import vllm.
 
 ENTRYPOINT ["./entrypoint.sh"]
