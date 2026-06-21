@@ -70,24 +70,31 @@ def prepare(model_path: str) -> None:
     next to the cached modeling file. QuasarLong.__init__ hard-checks
     os.path.isdir(_HERE/'raven'); under deepspeed zero.Init the model is built
     inside from_pretrained, so the cache must already contain raven/ first."""
+    import glob as _glob
+    import os as _os
+    import shutil as _shutil
+
     model_dir = Path(model_path).resolve()
     _add_path(model_dir)  # makes `import fla` and `import raven` resolve
-    # Force the remote modeling code to be copied into transformers_modules/ now
-    # (resolve the class, do NOT build the model), so link_raven can drop raven/
-    # beside it before from_pretrained constructs the layers.
+    src_raven = model_dir / "raven"
+    # Force the remote modeling code into the dynamic-module cache now (resolve the
+    # class, do NOT build the model) so the cache dir exists before from_pretrained.
     try:
         from transformers.dynamic_module_utils import get_class_from_dynamic_module
         get_class_from_dynamic_module(
             "modeling_quasar_long.QuasarLongForCausalLM", str(model_dir), trust_remote_code=True
         )
-    except Exception:
-        pass
-    try:
-        link_raven(model_dir)
-    except FileNotFoundError:
-        raise
-    except Exception:
-        pass
+    except Exception as _e:
+        print(f"[quasar] get_class warn: {_e}", flush=True)
+    # COPY raven/ next to every cached modeling file. Copy (not symlink) is robust
+    # under multi-rank deepspeed; QuasarLong.__init__ checks os.path.isdir(_HERE/raven).
+    cache_root = _os.path.join(_os.path.expanduser("~"), ".cache/huggingface/modules/transformers_modules")
+    dirs = _glob.glob(_os.path.join(cache_root, "*[Qq]uasar*", "*"))
+    print(f"[quasar] prepare: raven_src_exists={src_raven.is_dir()} cache_dirs={dirs}", flush=True)
+    for d in dirs:
+        if _os.path.isfile(_os.path.join(d, "modeling_quasar_long.py")) and not _os.path.isdir(_os.path.join(d, "raven")):
+            _shutil.copytree(src_raven, _os.path.join(d, "raven"), dirs_exist_ok=True)
+            print(f"[quasar] copied raven -> {d}/raven", flush=True)
 
 
 def load_tokenizer(model_path: str) -> PreTrainedTokenizerFast:
