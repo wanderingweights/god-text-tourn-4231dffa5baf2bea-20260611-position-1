@@ -266,6 +266,16 @@ def get_training_json(train_info: dict) -> dict:
     if "falcon" in model_name.lower():
         run_config["batch_size"] = int(run_config["batch_size"] / 2)
 
+    # QuasarLong (silx-ai/Quasar-Preview): FULL fine-tune (no LoRA), sdpa-only
+    # hybrid arch (no flash-attn / liger), tiny per-device batch for 18B full-FT.
+    # Keyed on model_name because arch autodetect needs trust_remote_code.
+    # paged_adamw_8bit (default) + zero3 across 4xH100 keep optimizer state in budget.
+    if "quasar" in model_name.lower():
+        run_config["use_lora"] = False
+        run_config["use_liger"] = "False"
+        run_config["disable_fa"] = "True"
+        run_config["batch_size"] = 1
+
     data_per_step = run_config["batch_size"] * run_config["gpu_nums"]
     if data_per_step >= 64:
         run_config["gradient_accumulation_steps"] = 1
