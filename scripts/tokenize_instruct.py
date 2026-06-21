@@ -282,7 +282,8 @@ def main(training_request_path: str):
     
     config_path = "test_axolotl.yml"
     tokenizer = AutoTokenizer.from_pretrained(
-        training_request["train_request"]["model_path"]
+        training_request["train_request"]["model_path"],
+        trust_remote_code=True,  # Quasar's tokenizer + <role> chat_template only load with this
     )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
