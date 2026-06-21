@@ -145,6 +145,39 @@ def fill_meta_params(model, model_path: str) -> int:
     return len(meta_names)
 
 
+# Params that are structurally unused in QuasarLong's forward for the
+# Quasar-Preview config and therefore NEVER receive a gradient:
+#   * branch_local_window_mix_logit — the local-window branch is disabled
+#     (hybrid_local_window_size=0), so this mix logit is dead.
+#   * quasar_attention.{A_log, dt_bias, f_proj.weight} — quasar-branch SSM params
+#     the fla scan path does not backprop into.
+# Under full fine-tune + ZeRO-3, deepspeed tries to reduce these params' grads and
+# hits `param.grad=None` -> "'NoneType' object has no attribute 'numel'". They do
+# not affect the forward, so they cannot be (and need not be) trained: freezing
+# them is the correct fix and lets full fine-tune run. Confirmed via grad probe
+# (one fwd/bwd) — exactly 46 params, all matching these suffixes.
+QUASAR_UNUSED_PARAM_SUFFIXES = (
+    "branch_local_window_mix_logit",
+    "quasar_attention.A_log",
+    "quasar_attention.dt_bias",
+    "quasar_attention.f_proj.weight",
+)
+
+
+def freeze_unused_params(model, suffixes=QUASAR_UNUSED_PARAM_SUFFIXES) -> int:
+    """Set requires_grad=False on params that get no gradient (see note above).
+
+    Must be called BEFORE deepspeed.initialize so the frozen params are excluded
+    from the ZeRO param groups / grad reduction. Returns the count frozen."""
+    frozen = 0
+    for name, p in model.named_parameters():
+        if p.requires_grad and any(name.endswith(s) for s in suffixes):
+            p.requires_grad = False
+            frozen += 1
+    print(f"[quasar] froze {frozen} structurally-unused (no-grad) params for ZeRO-3", flush=True)
+    return frozen
+
+
 def load_quasar_model(model_path: str):
     """Load QuasarLongForCausalLM with hybrid branches enabled (sdpa) and any
     meta params filled. Returns a CPU model; caller moves it to device."""

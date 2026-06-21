@@ -169,7 +169,13 @@ def load_lora_model(training_args: TrainingArguments, model_path: str, lora_args
 
 def load_model(training_args: TrainingArguments, model_path: str, token_nums: int):
     if quasar_loader.is_quasar(model_path):
-        return quasar_loader.load_quasar_model(model_path)
+        _m = quasar_loader.load_quasar_model(model_path)
+        # Freeze the handful of structurally-unused params (disabled local-window
+        # branch + quasar-branch SSM params the fla scan never backprops) so ZeRO-3
+        # full fine-tune doesn't try to reduce a None grad and crash. The CE loss
+        # already covers every param that affects the forward (grad-probe verified).
+        quasar_loader.freeze_unused_params(_m)
+        return _m
 
     model_class = transformers.AutoModelForCausalLM
 
