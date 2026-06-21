@@ -310,11 +310,17 @@ def main(training_request_path: str):
         import os as _os
         import json as _json
         tokenizer = quasar_loader.load_tokenizer(_mp)
+        _ct = None
         _tc = _os.path.join(_mp, "tokenizer_config.json")
         if _os.path.exists(_tc):
-            _cfg = _json.load(open(_tc))
-            if _cfg.get("chat_template"):
-                tokenizer.chat_template = _cfg["chat_template"]
+            _ct = _json.load(open(_tc)).get("chat_template")
+        if not _ct:  # Quasar ships its <role> template in a separate chat_template.jinja
+            _jinja = _os.path.join(_mp, "chat_template.jinja")
+            if _os.path.exists(_jinja):
+                _ct = open(_jinja).read()
+        if not _ct:
+            raise RuntimeError(f"no chat_template found in {_mp} (tokenizer_config.json / chat_template.jinja)")
+        tokenizer.chat_template = _ct
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     max_length = -1  # default value in test_axolot.yml
