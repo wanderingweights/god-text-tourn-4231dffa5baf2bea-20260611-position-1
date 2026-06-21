@@ -251,7 +251,9 @@ def run_training(
                 f.write("STARTING TRAINING")
 
         training_env_vars = {
-            "WANDB_MODE": "offline",
+            "WANDB_MODE": os.environ.get("WANDB_MODE", "online"),
+            "WANDB_PROJECT": os.environ.get("WANDB_PROJECT", "quasar-sft-e2e"),
+            "WANDB_ENTITY": os.environ.get("WANDB_ENTITY", "subiawaud"),
             "WANDB_RUN_ID": f"{task_id}_{expected_repo_name}",
             "WANDB_NAME": f"{task_id}_{expected_repo_name}",
         }
