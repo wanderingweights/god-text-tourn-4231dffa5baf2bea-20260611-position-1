@@ -202,11 +202,11 @@ def split_dataset(
     if n_removed:
         print(f"Removed {n_removed} empty output items before split")
 
-    # Dev size: ~3% of dataset, capped at 1000 and at most 20% of total data.
+    # Dev size: ~3% of dataset, capped at 5000 and at most 20% of total data.
     # Bigger dev set = less eval noise, which checkpoint averaging selection
     # relies on. Small datasets are unchanged (the 20% floor protects training
     # data); only larger datasets get the bigger, more reliable dev set.
-    dev_size = min(1000, max(min(400, len(data) // 5), len(data) // 33))
+    dev_size = min(5000, max(min(400, len(data) // 5), len(data) // 33))
     print(f"Escolhendo {dev_size} pro teste (dados={len(data)})")
 
     dev_items, train_items = stratified_split(
