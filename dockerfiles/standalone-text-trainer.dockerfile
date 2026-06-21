@@ -50,6 +50,12 @@ RUN pip install uv && \
     pip install tiktoken==0.9.0 && \
     pip install flash-attn==v2.7.4.post1 --no-build-isolation && \
     pip install "fiber @ git+https://github.com/rayonlabs/fiber.git@2.4.0"
+
+# The runpod base image ships torch-2.4 torchvision/torchaudio; the torch 2.7.1
+# bump above leaves them ABI-mismatched (transformers lazily imports them ->
+# "operator torchvision::nms does not exist" / libtorchaudio undefined symbol).
+# The text trainer needs neither — remove them so those imports are skipped.
+RUN pip uninstall -y torchvision torchaudio || true
 # vLLM (GRPO rollouts only) is intentionally NOT installed here: vllm==0.8.3
 # pins torch 2.4 and conflicts with the torch 2.7 bump above. GRPO support on
 # the bumped stack needs a torch-2.7-compatible vllm (>=0.10) and is a separate
