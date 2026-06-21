@@ -288,10 +288,24 @@ def main(training_request_path: str):
     )
     
     config_path = "test_axolotl.yml"
-    tokenizer = AutoTokenizer.from_pretrained(
-        training_request["train_request"]["model_path"],
-        trust_remote_code=True,  # Quasar's tokenizer + <role> chat_template only load with this
-    )
+    _mp = training_request["train_request"]["model_path"]
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(_mp, trust_remote_code=True)
+    except Exception as _e:
+        # Quasar's tokenizer_config declares a custom "TokenizersBackend" class that
+        # AutoTokenizer (esp. the axolotl env's transformers) can't instantiate. Load
+        # the fast tokenizer from tokenizer.json directly and attach the chat_template
+        # from tokenizer_config.json (AutoTokenizer never got that far).
+        print(f"AutoTokenizer failed ({_e}); using quasar_loader fallback", flush=True)
+        import quasar_loader
+        import os as _os
+        import json as _json
+        tokenizer = quasar_loader.load_tokenizer(_mp)
+        _tc = _os.path.join(_mp, "tokenizer_config.json")
+        if _os.path.exists(_tc):
+            _cfg = _json.load(open(_tc))
+            if _cfg.get("chat_template"):
+                tokenizer.chat_template = _cfg["chat_template"]
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     max_length = -1  # default value in test_axolot.yml
