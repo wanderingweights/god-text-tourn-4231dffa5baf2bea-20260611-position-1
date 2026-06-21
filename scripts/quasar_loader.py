@@ -66,12 +66,22 @@ def link_raven(model_dir: Path) -> None:
 
 
 def prepare(model_path: str) -> None:
-    """Make fla + raven importable before from_pretrained."""
+    """Make fla + raven importable before from_pretrained AND ensure raven/ sits
+    next to the cached modeling file. QuasarLong.__init__ hard-checks
+    os.path.isdir(_HERE/'raven'); under deepspeed zero.Init the model is built
+    inside from_pretrained, so the cache must already contain raven/ first."""
     model_dir = Path(model_path).resolve()
     _add_path(model_dir)  # makes `import fla` and `import raven` resolve
-    # Pre-create the dynamic-module cache so the modeling file's _HERE/raven
-    # check passes; harmless if the cache is created later (link_raven is also
-    # re-run by load_quasar_model after from_pretrained populates the cache).
+    # Force the remote modeling code to be copied into transformers_modules/ now
+    # (resolve the class, do NOT build the model), so link_raven can drop raven/
+    # beside it before from_pretrained constructs the layers.
+    try:
+        from transformers.dynamic_module_utils import get_class_from_dynamic_module
+        get_class_from_dynamic_module(
+            "modeling_quasar_long.QuasarLongForCausalLM", str(model_dir), trust_remote_code=True
+        )
+    except Exception:
+        pass
     try:
         link_raven(model_dir)
     except FileNotFoundError:
