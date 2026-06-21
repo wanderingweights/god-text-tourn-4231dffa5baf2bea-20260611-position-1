@@ -194,8 +194,17 @@ def split_dataset(
         if not isinstance(data, list):
             data = [data]
     except json.JSONDecodeError:
-        # JSONL (one record per line) — the sft-e2e pipeline emits this format
-        data = [json.loads(line) for line in content.splitlines() if line.strip()]
+        # JSONL (one record per line); skip any malformed/truncated line rather
+        # than aborting the whole tokenize step.
+        data = []
+        for line in content.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                data.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
 
     random.seed(seed)
     random.shuffle(data)
