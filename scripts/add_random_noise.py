@@ -11,9 +11,9 @@ import datetime
 # Configuration
 
 def main(model_path: str, save_folder: str):
-    model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.bfloat16, device_map="auto")
+    model = AutoModelForCausalLM.from_pretrained(model_path, torch_dtype=torch.bfloat16, device_map="auto", trust_remote_code=True)
     model.generation_config = GenerationConfig(temperature=None, top_p=None)
-    tokenizer = AutoTokenizer.from_pretrained(model_path)
+    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
     noise_std = 0.01
 
     # Step 2: Add random noise to the input embeddings

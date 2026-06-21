@@ -188,7 +188,14 @@ def split_dataset(
     from val_split import stratified_split, concat_all_text
 
     with open(total_data_path, "r") as file:
-        data = json.load(file)
+        content = file.read()
+    try:
+        data = json.loads(content)
+        if not isinstance(data, list):
+            data = [data]
+    except json.JSONDecodeError:
+        # JSONL (one record per line) — the sft-e2e pipeline emits this format
+        data = [json.loads(line) for line in content.splitlines() if line.strip()]
 
     random.seed(seed)
     random.shuffle(data)
