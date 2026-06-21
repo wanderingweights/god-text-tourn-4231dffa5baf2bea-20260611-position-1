@@ -531,7 +531,7 @@ def main():
     )
     _trainer_kwargs = dict(
         model=model,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,  # transformers 5.x renamed Trainer(tokenizer=) -> processing_class
         args=training_args,
         train_dataset=train_ds,
         eval_dataset=dev_ds,
