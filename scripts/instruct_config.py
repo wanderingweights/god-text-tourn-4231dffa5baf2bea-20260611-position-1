@@ -281,6 +281,18 @@ def get_training_json(train_info: dict) -> dict:
         # box (4 GPUs -> accum 16, 8 GPUs -> accum 8). Without this an 8-GPU box
         # silently doubles the effective batch to 128.
         run_config["gpu_nums"] = get_gpu_count()
+        # paged_adamw_8bit (bnb) is an "untested optimizer" under deepspeed ZeRO-3:
+        # it does NOT shard, keeping full 8-bit state (~36GB) on every GPU and
+        # pinning the cards near the 80GB ceiling. adamw_torch is a ZeRO-3-native
+        # optimizer deepspeed partitions across ranks (~4.5GB/GPU sharded fp32
+        # state + master), reclaiming ~18GB/GPU of headroom for batch/packing.
+        run_config["optimizer"] = "adamw_torch"
+        # With the optimizer memory reclaimed, raise per-device batch to feed the
+        # 256-expert MoE (bs=1 -> ~20 tokens/expert is GEMM-starved). At 8 GPUs the
+        # grad-accum math auto-rebalances (bs2 -> accum4) so the effective batch
+        # stays 64; this only enlarges the per-microbatch token count. bs>1 pads to
+        # full context (no truncation) — see the pad path in train_instruct.
+        run_config["batch_size"] = 2
         # Reasoning-trace SFT wants a HIGHER LR than generic instruction SFT
         # (~1-2e-5). Llama-Nemotron (arXiv:2505.00949) used 1e-4 for LN-Nano and
         # notes "higher learning rates were required to effectively learn from long

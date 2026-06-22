@@ -272,11 +272,11 @@ def main():
         max_length = train_request["max_length"]
 
     # we already tokenize the data and save it to .pt (torch format, fast)
-    # Quasar trains UNpacked at bs=1 (hybrid linear-attention can't sample-pack);
-    # pad=False there -> natural-length sequences instead of padding every item to
-    # max_length (~3x wasted compute/memory on -100 pad tokens). Other models keep
-    # padding (pad=True) — they may run bs>1 where the collator needs equal lengths.
-    _pad_items = not is_quasar
+    # Quasar trains UNpacked: at bs=1 use pad=False (natural length, no ~3x pad
+    # waste). At bs>1 we MUST pad to full context (the collator stacks equal-length
+    # tensors) — this preserves context (pads short seqs up, never truncates); the
+    # linear branches isolate the padded sequences via the attention mask/cu_seqlens.
+    _pad_items = (not is_quasar) or (training_args.per_device_train_batch_size > 1)
     train_ds = MyDataset(
         tokenizer,
         f"datasets/train_tokenized_{task_id}.json",
