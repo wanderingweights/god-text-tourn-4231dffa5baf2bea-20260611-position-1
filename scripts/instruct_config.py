@@ -275,6 +275,13 @@ def get_training_json(train_info: dict) -> dict:
         run_config["use_liger"] = "False"
         run_config["disable_fa"] = "True"
         run_config["batch_size"] = 1
+        # Reasoning-trace SFT wants a HIGHER LR than generic instruction SFT
+        # (~1-2e-5). Llama-Nemotron (arXiv:2505.00949) used 1e-4 for LN-Nano and
+        # notes "higher learning rates were required to effectively learn from long
+        # reasoning traces" — which is exactly this <think>-heavy data. Sets the
+        # base; the stats LR finder (if baseline_stats present) and reg_ratio still
+        # adjust it. Default 8e-5 was too low for this regime.
+        run_config["learning_rate"] = 1e-4
 
     data_per_step = run_config["batch_size"] * run_config["gpu_nums"]
     if data_per_step >= 64:

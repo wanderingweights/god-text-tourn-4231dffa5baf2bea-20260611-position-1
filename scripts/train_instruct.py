@@ -33,6 +33,8 @@ import yaml
 from state_manager import get_state, set_state
 import quasar_loader
 
+import warnings
+
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", "0"))
 
 
@@ -169,6 +171,13 @@ def load_lora_model(training_args: TrainingArguments, model_path: str, lora_args
 
 def load_model(training_args: TrainingArguments, model_path: str, token_nums: int):
     if quasar_loader.is_quasar(model_path):
+        # Quasar's modeling calls transformers' deprecated AttentionMaskConverter
+        # API, firing a FutureWarning on EVERY forward that floods the logs. Silence
+        # just that line, and ONLY on the Quasar path so other models' warnings are
+        # untouched. Harmless model-author deprecation, not ours to fix.
+        warnings.filterwarnings(
+            "ignore", message=r"The attention mask API under", category=FutureWarning
+        )
         _m = quasar_loader.load_quasar_model(model_path)
         # Freeze the handful of structurally-unused params (disabled local-window
         # branch + quasar-branch SSM params the fla scan never backprops) so ZeRO-3
