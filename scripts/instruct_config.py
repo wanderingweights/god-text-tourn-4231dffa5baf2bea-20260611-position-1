@@ -274,25 +274,21 @@ def get_training_json(train_info: dict) -> dict:
         run_config["use_lora"] = False
         run_config["use_liger"] = "False"
         run_config["disable_fa"] = "True"
-        run_config["batch_size"] = 1
-        # gpu_nums above came from the hardcoded model-size bucket (15_40_b -> 4),
-        # but deepspeed launches on ALL visible GPUs. Use the real device count so
-        # the grad-accum math below hits the intended effective batch of 64 on any
-        # box (4 GPUs -> accum 16, 8 GPUs -> accum 8). Without this an 8-GPU box
-        # silently doubles the effective batch to 128.
         run_config["gpu_nums"] = get_gpu_count()
-        # paged_adamw_8bit (bnb) is an "untested optimizer" under deepspeed ZeRO-3:
-        # it does NOT shard, keeping full 8-bit state (~36GB) on every GPU and
-        # pinning the cards near the 80GB ceiling. adamw_torch is a ZeRO-3-native
-        # optimizer deepspeed partitions across ranks (~4.5GB/GPU sharded fp32
-        # state + master), reclaiming ~18GB/GPU of headroom for batch/packing.
-        run_config["optimizer"] = "adamw_torch"
-        # With the optimizer memory reclaimed, raise per-device batch to feed the
-        # 256-expert MoE (bs=1 -> ~20 tokens/expert is GEMM-starved). At 8 GPUs the
-        # grad-accum math auto-rebalances (bs2 -> accum4) so the effective batch
-        # stays 64; this only enlarges the per-microbatch token count. bs>1 pads to
-        # full context (no truncation) — see the pad path in train_instruct.
-        run_config["batch_size"] = 2
+        # --- B300 single-node config (quasar-ddp branch) ---
+        # An 18B full fine-tune + 8-bit optimizer + a large batch fit on ONE B300
+        # (288GB), so skip deepspeed ZeRO-3 entirely and run plain DDP (1 GPU ->
+        # python, N GPUs on the node -> torchrun). Removes BOTH the ZeRO-3 param
+        # all-gather overhead AND the deepspeed-launcher triton crash seen on H100.
+        run_config["distributed"] = "ddp"
+        # No sharding -> no need for a ZeRO-3-shardable optimizer. paged_adamw_8bit
+        # keeps full state per rank but at 8-bit (~36GB) leaves the most room for a
+        # big batch (the bnb/ZeRO-3 "untested optimizer" issue is moot without ds).
+        run_config["optimizer"] = "paged_adamw_8bit"
+        # B300 has headroom to feed the 256-expert MoE — bs=1 starves it
+        # (~20 tokens/expert). Start at 8 (grad-accum auto-keeps effective batch 64);
+        # tune up on the box toward ~85% memory. bs>1 pads to full context (no trunc).
+        run_config["batch_size"] = 8
         # Reasoning-trace SFT wants a HIGHER LR than generic instruction SFT
         # (~1-2e-5). Llama-Nemotron (arXiv:2505.00949) used 1e-4 for LN-Nano and
         # notes "higher learning rates were required to effectively learn from long
