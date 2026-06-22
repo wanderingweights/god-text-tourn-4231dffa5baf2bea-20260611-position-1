@@ -275,6 +275,12 @@ def get_training_json(train_info: dict) -> dict:
         run_config["use_liger"] = "False"
         run_config["disable_fa"] = "True"
         run_config["batch_size"] = 1
+        # gpu_nums above came from the hardcoded model-size bucket (15_40_b -> 4),
+        # but deepspeed launches on ALL visible GPUs. Use the real device count so
+        # the grad-accum math below hits the intended effective batch of 64 on any
+        # box (4 GPUs -> accum 16, 8 GPUs -> accum 8). Without this an 8-GPU box
+        # silently doubles the effective batch to 128.
+        run_config["gpu_nums"] = get_gpu_count()
         # Reasoning-trace SFT wants a HIGHER LR than generic instruction SFT
         # (~1-2e-5). Llama-Nemotron (arXiv:2505.00949) used 1e-4 for LN-Nano and
         # notes "higher learning rates were required to effectively learn from long
