@@ -149,12 +149,21 @@ def gaussian_subsample(samples: list[dict], target_size: int, seed: int = 42) ->
     return [samples[i] for i in indices]
 
 
-def pad_inputs(tokenizer: AutoTokenizer, input_dict: dict, max_length: int, padding_side: str) -> dict:
+def pad_inputs(tokenizer: AutoTokenizer, input_dict: dict, max_length: int, padding_side: str, pad: bool = True) -> dict:
     assert padding_side in ["left", "right"]
     if max_length <= 0:
         return input_dict
     # Smart truncate: preserve completion tokens, trim prompt side
     input_dict = smart_truncate(input_dict, max_length)
+    if not pad:
+        # Truncate-only: return the natural (variable) length. Used for models
+        # trained UNpacked at batch_size=1 (e.g. Quasar's hybrid linear-attention
+        # arch, which can't use FA/naive sample packing): padding every item to
+        # max_length there is pure waste (~3x for mean-664 data padded to 2048) —
+        # pad tokens carry label -100 so they never affect the loss, only compute.
+        # Safe ONLY at per-device bs=1 (default collator stacks one item, so the
+        # varying length needs no cross-item padding).
+        return input_dict
     result = {
         "input_ids": pad_sequence(input_dict["input_ids"], tokenizer.pad_token_id, max_length, padding_side),
         "attention_mask": pad_sequence(input_dict["attention_mask"], 0, max_length, padding_side),
@@ -164,13 +173,15 @@ def pad_inputs(tokenizer: AutoTokenizer, input_dict: dict, max_length: int, padd
 
 
 class MyDataset(Dataset):
-    def __init__(self, tokenizer: AutoTokenizer, data_path: str, max_length: int) -> None:
+    def __init__(self, tokenizer: AutoTokenizer, data_path: str, max_length: int, pad: bool = True) -> None:
         super().__init__()
         with open(data_path, 'r') as file:
             self.eval_dataset = json.load(file)
 
         self.tokenizer = tokenizer
         self.max_length = max_length
+        # pad=False -> truncate-only, natural length (bs=1 unpacked models). See pad_inputs.
+        self.pad = pad
         print("padding_side: ", self.tokenizer.padding_side)
 
     def __len__(self):
@@ -178,7 +189,7 @@ class MyDataset(Dataset):
 
     def __getitem__(self, idx):
         dp = self.eval_dataset[idx]
-        input_dict = pad_inputs(self.tokenizer, dp, self.max_length, self.tokenizer.padding_side)
+        input_dict = pad_inputs(self.tokenizer, dp, self.max_length, self.tokenizer.padding_side, pad=self.pad)
         for key in input_dict:
             input_dict[key] = torch.tensor(input_dict[key])
         return input_dict
