@@ -104,7 +104,7 @@ def extract_value_from_cmd(cmd: str, arg_name: str):
 
 def get_model_architecture(model_name: str) -> str:
     try:
-        config = AutoConfig.from_pretrained(model_name)
+        config = AutoConfig.from_pretrained(model_name, trust_remote_code=True)
         architectures = config.architectures
         if len(architectures) > 1:
             return "Multiple architectures"

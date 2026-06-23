@@ -324,7 +324,7 @@ def get_training_json(train_info: dict) -> dict:
     model_max_pos = None
     try:
         from transformers import AutoConfig
-        cfg = AutoConfig.from_pretrained(train_info["model_path"])
+        cfg = AutoConfig.from_pretrained(train_info["model_path"], trust_remote_code=True)
         model_max_pos = getattr(cfg, "max_position_embeddings", None)
     except Exception:
         pass
