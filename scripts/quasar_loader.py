@@ -127,12 +127,16 @@ def fill_meta_params(model, model_path: str) -> int:
     The hybrid (sdpa) branches can leave params on meta after from_pretrained.
     Returns the number of params filled."""
     model_dir = Path(model_path).resolve()
-    index = json.loads(
-        (model_dir / "model.safetensors.index.json").read_text()
-    )["weight_map"]
     meta_names = [n for n, p in model.named_parameters() if getattr(p, "is_meta", False)]
     if not meta_names:
         return 0
+    idx_path = model_dir / "model.safetensors.index.json"
+    if idx_path.exists():
+        index = json.loads(idx_path.read_text())["weight_map"]
+    else:
+        # Single-file checkpoint (no shard index) — e.g. a warm-start continue-from
+        # checkpoint saved as one model.safetensors. Every param lives in that file.
+        index = {n: "model.safetensors" for n in meta_names}
     by_file = {}
     for name in meta_names:
         by_file.setdefault(index[name], []).append(name)
