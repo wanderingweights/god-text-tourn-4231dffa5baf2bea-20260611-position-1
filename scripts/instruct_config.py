@@ -352,6 +352,12 @@ def get_training_json(train_info: dict) -> dict:
     else:
         max_length = None
 
+    # Quasar: fixed 8k context. Recovers the long reasoning samples that 4k drops
+    # (~16% of this set); batch_size is pinned in train_instruct (is_quasar) so skip
+    # the adaptive compensation here. Must equal the pack buffer in train_instruct.py.
+    if "quasar" in model_architecture.strip().lower():
+        max_length = 8192
+
     run_config["learning_rate"] *= train_info["reg_ratio"]
     run_cmd = get_run_cmd(run_config, run_config["gpu_nums"])
     train_request = deepcopy(train_info)

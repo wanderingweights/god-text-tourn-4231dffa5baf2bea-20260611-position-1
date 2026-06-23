@@ -43,12 +43,11 @@ RUN bash -c "source /workspace/axo_py/bin/activate && \
 # torch is installed FIRST so flash-attn compiles against 2.7.
 RUN pip install uv && \
     pip install -U packaging==23.2 setuptools==75.8.0 wheel ninja && \
-    pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu126 && \
+    pip install torch==2.7.1 --index-url https://download.pytorch.org/whl/cu128 && \
     uv pip install -r /workspace/scripts/training_requirements.txt --system && \
     pip install hf_transfer==0.1.9 && \
     pip install tenacity==9.1.2 && \
     pip install tiktoken==0.9.0 && \
-    pip install flash-attn==v2.7.4.post1 --no-build-isolation && \
     pip install "fiber @ git+https://github.com/rayonlabs/fiber.git@2.4.0"
 
 # The runpod base image ships torch-2.4 torchvision/torchaudio; the torch 2.7.1
@@ -56,6 +55,14 @@ RUN pip install uv && \
 # "operator torchvision::nms does not exist" / libtorchaudio undefined symbol).
 # The text trainer needs neither — remove them so those imports are skipped.
 RUN pip uninstall -y torchvision torchaudio || true
+
+# Blackwell (B200/B300, sm_100/sm_103) codegen. torch 2.7.1's bundled triton 3.3.1
+# can't lower sm_103 at all (LLVM "cannot select shfl.sync"); triton 3.5 fixes shfl
+# but still can't lower Blackwell 5th-gen tensor-core MMA (tcgen05.* intrinsics);
+# triton 3.7.1 does. triton's own bundled ptxas also predates sm_103a, so ship a
+# CUDA 12.9 ptxas (nvidia-cuda-nvcc-cu12) and point triton at it. No-op on pre-Blackwell.
+RUN pip install --no-cache-dir --pre "triton==3.7.1" nvidia-cuda-nvcc-cu12
+ENV TRITON_PTXAS_PATH=/usr/local/lib/python3.11/dist-packages/nvidia/cuda_nvcc/bin/ptxas
 # vLLM (GRPO rollouts only) is intentionally NOT installed here: vllm==0.8.3
 # pins torch 2.4 and conflicts with the torch 2.7 bump above. GRPO support on
 # the bumped stack needs a torch-2.7-compatible vllm (>=0.10) and is a separate

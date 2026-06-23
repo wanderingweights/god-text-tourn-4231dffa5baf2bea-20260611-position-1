@@ -184,6 +184,14 @@ def load_model(training_args: TrainingArguments, model_path: str, token_nums: in
         # full fine-tune doesn't try to reduce a None grad and crash. The CE loss
         # already covers every param that affects the forward (grad-probe verified).
         quasar_loader.freeze_unused_params(_m)
+        # transformers 5.x save_pretrained expects _tied_weights_keys as a DICT; this
+        # model declares it as a LIST (old format) -> remove_tied_weights_from_state_dict
+        # crashes ("'list' object has no attribute 'keys'") on EVERY checkpoint save.
+        # tie_word_embeddings=False here (untied), so clear the list-form attr on any
+        # module that has it -> save skips tied-weight removal and writes all weights.
+        for _mod in _m.modules():
+            if isinstance(getattr(_mod, "_tied_weights_keys", None), list):
+                _mod._tied_weights_keys = None
         return _m
 
     model_class = transformers.AutoModelForCausalLM
@@ -250,9 +258,33 @@ def main():
         # config) and make fla/raven importable before any model load.
         quasar_loader.prepare(train_request["model_path"])
         tokenizer = quasar_loader.load_tokenizer(train_request["model_path"])
-        # Hybrid linear-attention branches are incompatible with FA sample
-        # packing; train unpacked.
-        training_args.packing = False
+        # Sample-packing is now CORRECT for Quasar: the model build isolates packed
+        # segments (block-diagonal SDPA mask + per-segment cu_seqlens, BOTH derived from
+        # position_ids that reset per segment). So enable the NAIVE packer
+        # (monkeypatch.pack_data_points_naive): concat segments, position_ids = arange
+        # per segment, labels[0] = -100 per segment (kills the cross-segment boundary
+        # target), trailing pad with position_ids=0. NOT the FA packer (no flash-attn on
+        # Blackwell). Buffer = max_length (forced to 4096 below). grad-accum stays at the
+        # instruct_config default (doesn't affect tok/s).
+        # CAVEATS: (a) needs the isolating model build deployed (box's model dir is
+        # pristine); (b) a sample > buffer overflows pack_data_points_naive's fixed-len
+        # assert -> the >buffer "giants" need the own-buffer/bs=1 path (follow-up; none
+        # in the <=2021 test split).
+        training_args.packing = True
+        train_request["packing_mode"] = "naive"
+        # Bypassing the LR search (below) removes its OOM-driven 8->4 batch halving, so
+        # pin the batch that fits the 4096 buffer (bs=8 = 32768 tok/microbatch OOMs).
+        training_args.per_device_train_batch_size = 2
+        # NOTE: do NOT set ddp_find_unused_parameters=True. Quasar's vectorized MoE
+        # computes ALL experts every step, so there are zero unused params (DDP confirms:
+        # "did not find any unused parameters in the forward pass"). The flag only buys an
+        # extra autograd-graph traversal per iteration (slower). Leave it at the default
+        # (off), same as every other model on this script.
+        # Target total batch = per_device(2) x grad_accum(16) x world(2 GPUs) = 64 packed
+        # seqs/optimizer-step. At 8k ctx, bs=2 keeps per-microbatch tokens (2x8192) equal
+        # to the old bs=4x4096, so per-step memory holds ~constant; accum doubled 8->16 to
+        # hold the effective batch at 64 sequences. Adjust if the GPU count changes.
+        training_args.gradient_accumulation_steps = 16
     else:
         from model_utility import load_tokenizer
         tokenizer = load_tokenizer(train_request["model_path"])
@@ -270,13 +302,20 @@ def main():
     max_length = get_max_length_config()
     if "max_length" in train_request:
         max_length = train_request["max_length"]
+    if is_quasar:
+        # Pack-buffer length (PackedDataset.max_input_length). 8k recovers the long
+        # reasoning samples that 4k dropped (~16% of the set). MUST equal the tokenize
+        # drop threshold (instruct_config sets train_request["max_length"]=8192 for
+        # Quasar). Samples > buffer still overflow pack_data_points_naive's fixed-length
+        # assert (the >8192 "giants" need the own-buffer/bs=1 path — follow-up).
+        max_length = 8192
 
     # we already tokenize the data and save it to .pt (torch format, fast)
-    # Quasar trains UNpacked: at bs=1 use pad=False (natural length, no ~3x pad
-    # waste). At bs>1 we MUST pad to full context (the collator stacks equal-length
-    # tensors) — this preserves context (pads short seqs up, never truncates); the
-    # linear branches isolate the padded sequences via the attention mask/cu_seqlens.
-    _pad_items = (not is_quasar) or (training_args.per_device_train_batch_size > 1)
+    # Quasar: MyDataset yields NATURAL length (pad=False); the custom collator (below)
+    # pads each batch to a FIXED max_length (one stable shape -> triton kernels cache)
+    # and counts real-vs-pad tokens for the throughput log. Non-Quasar keeps in-dataset
+    # fixed-length padding.
+    _pad_items = not is_quasar
     train_ds = MyDataset(
         tokenizer,
         f"datasets/train_tokenized_{task_id}.json",
@@ -515,7 +554,7 @@ def main():
     # host RAM; disk-based averaging of consolidated checkpoints for sharded
     # (FSDP/DeepSpeed) or too-big models, where in-RAM snapshots are only shards.
     _shard_ds = getattr(training_args, "deepspeed", None) is not None
-    _sharded = _shard_ds or len(training_args.fsdp) > 0
+    _sharded = _shard_ds or bool(getattr(training_args, "fsdp", None))
     _trainable_bytes = sum(p.numel() for p in model.parameters() if p.requires_grad) * 2
     # RAM peak holds ~6x trainable bytes (best + 3-window + avg + stash).
     _avg_mode = "disk" if (_sharded or 6 * _trainable_bytes > 100e9) else "ram"
@@ -551,14 +590,220 @@ def main():
         steps_per_epoch=total_steps_per_epoch,
         max_steps=max_steps,
     )
+    # Quasar collator: pad each batch to a FIXED max_length (ONE stable shape so triton
+    # /fla kernels compile once and cache; variable shapes => recompile thrash). Tallies
+    # real vs padded tokens into _tput for the throughput callback below.
+    import time as _time
+    _tput = {"real": 0, "pad": 0, "t": None}
+    _pad_log = {"n": 0}
+    def _quasar_pad_collator(features):
+        # Packed rows (PackedDataset) are exactly max_length and carry position_ids (the
+        # per-segment reset = the isolation signal) + labels (segment starts already
+        # -100). Pad to a FIXED max_length = ONE stable shape (triton cache); PRESERVE
+        # position_ids (key-aware); tally real-vs-pad tokens from attention_mask for
+        # [sn56][tput]. (Pre-packing/unpacked rows simply lack position_ids -> skipped.)
+        pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
+        right = tokenizer.padding_side != "left"
+        pad_to = max_length
+        fill = {"input_ids": pad_id, "attention_mask": 0, "labels": -100, "position_ids": 0}
+        keys = [k for k in fill if k in features[0]]
+        def _pad(t, val):
+            d = pad_to - int(t.shape[0])
+            if d < 0:
+                return t[:pad_to]
+            if d == 0:
+                return t
+            tail = t.new_full((d,), val)
+            return torch.cat([t, tail] if right else [tail, t])
+        batch = {k: torch.stack([_pad(f[k], fill[k]) for f in features]) for k in keys}
+        real = int(batch["attention_mask"].sum()); total = int(batch["attention_mask"].numel())
+        _tput["real"] += real
+        _tput["pad"] += (total - real)
+        _pad_log["n"] += 1
+        if _pad_log["n"] <= 6 or _pad_log["n"] % 100 == 0:
+            log_info("[sn56][pad] batch#%d bs=%d pad_to=%d real=%d/%d (%.0f%% real, packed=%s)"
+                     % (_pad_log["n"], len(features), pad_to, real, total,
+                        100.0 * real / max(1, total), "position_ids" in features[0]))
+        return batch
+
+    from transformers import TrainerCallback as _TrainerCB
+    class _ThroughputCB(_TrainerCB):
+        # Logs real tok/s every optimizer step (grad_accum=1 -> every microbatch) so
+        # throughput is visible from step 1 instead of hand-counting log lines.
+        def on_step_end(self, args, state, control, **kw):
+            now = _time.time()
+            if _tput["t"] is not None:
+                dt = now - _tput["t"]
+                tot = _tput["real"] + _tput["pad"]
+                if dt > 0 and tot > 0:
+                    log_info("[sn56][tput] step %d: %.2fs/step | %.0f real tok/s | %.0f tok/s w/pad | %.0f%% pad"
+                             % (state.global_step, dt, _tput["real"] / dt, tot / dt, 100.0 * _tput["pad"] / tot))
+            _tput["t"] = now
+            _tput["real"] = 0
+            _tput["pad"] = 0
+
+    class _HFCkptUpload(_TrainerCB):
+        # Crash-safety: push each saved checkpoint to HF (latest-only / overwrite) so a
+        # box failure doesn't lose the trained model — our direct text_trainer runs skip
+        # job_handler's HF push, so without this saves are local-only. Repo from env
+        # HF_CKPT_REPO, token from env HUGGINGFACE_TOKEN/HF_TOKEN (no secret in-script);
+        # no-op if unset. Uploads model files only (skips optimizer.pt); never raises.
+        def __init__(self):
+            self.repo = os.environ.get("HF_CKPT_REPO", "")
+            tok = os.environ.get("HUGGINGFACE_TOKEN") or os.environ.get("HF_TOKEN")
+            self.api = None
+            if self.repo and tok:
+                try:
+                    from huggingface_hub import HfApi
+                    self.api = HfApi(token=tok)
+                    self.api.create_repo(self.repo, repo_type="model", private=False, exist_ok=True)
+                    log_info(f"[sn56][hf] checkpoint uploads -> {self.repo} (latest-only)")
+                except Exception as e:
+                    log_info(f"[sn56][hf] upload disabled (repo init failed: {e})")
+                    self.api = None
+            else:
+                log_info("[sn56][hf] checkpoint upload OFF (set HF_CKPT_REPO + HUGGINGFACE_TOKEN to enable)")
+
+        def on_save(self, args, state, control, **kw):
+            if self.api is None:
+                return
+            import glob as _glob
+            ckpt = os.path.join(args.output_dir, f"checkpoint-{state.global_step}")
+            if not os.path.isdir(ckpt):
+                cks = [c for c in _glob.glob(os.path.join(args.output_dir, "checkpoint-*"))
+                       if c.rsplit("-", 1)[-1].isdigit()]
+                ckpt = max(cks, key=lambda c: int(c.rsplit("-", 1)[-1])) if cks else None
+            if not ckpt or not os.path.isdir(ckpt):
+                log_info(f"[sn56][hf] no checkpoint dir to upload at step {state.global_step}")
+                return
+            try:
+                _t0 = _time.time()
+                self.api.upload_folder(
+                    repo_id=self.repo, folder_path=ckpt, repo_type="model",
+                    allow_patterns=["*.safetensors", "*.json", "*.jinja", "tokenizer*", "*.model", "*.txt"],
+                    commit_message=f"checkpoint step {state.global_step}",
+                )
+                log_info(f"[sn56][hf] uploaded checkpoint-{state.global_step} -> {self.repo} ({_time.time()-_t0:.0f}s)")
+            except Exception as e:
+                log_info(f"[sn56][hf] upload FAILED (step {state.global_step}): {e}")
+
+    class _EarlyFailSaveCB(_TrainerCB):
+        # Early fail-check ONLY: force a SINGLE checkpoint at step 10 so a broken save
+        # path surfaces in minutes instead of after hours. Leaves the normal save
+        # schedule (CustomEvalSaveCallback / ckpt_avg) and training dynamics (grad-accum)
+        # completely untouched. Set on ALL ranks so DDP agrees on the save step.
+        def on_step_end(self, args, state, control, **kw):
+            if state.global_step == 10:
+                control.should_save = True
+            return control
+
+    class _MoEUtilCB(_TrainerCB):
+        # MoE utilization -> wandb (rank-0, aggregated over all MoE layers). Non-invasive:
+        # forward hooks read each block's topk_idx (routed expert choices) + output norms,
+        # so no edits to silx's model code. Env MOE_LOG=0 disables. Per-expert load
+        # histogram every `hist_every` log calls (heavier than the scalars).
+        def __init__(self, num_experts, hist_every=10):
+            self.num_experts = int(num_experts)
+            self.hist_every = hist_every
+            self.counts = None        # [num_experts] cumulative routed-slot counts
+            self.shared_norm = 0.0    # sum ||shared_expert_out||
+            self.total_norm = 0.0     # sum ||moe_block_out|| (routed+shared)
+            self._handles = []
+            self._log_calls = 0
+
+        def _moe_hook(self, module, inp, out):
+            # out = (y_total, (router_logits, topk_idx)); topk_idx [bsz, seq, top_k]
+            try:
+                idx = out[1][1].reshape(-1)
+                c = torch.bincount(idx, minlength=self.num_experts).double()
+                if self.counts is None:
+                    self.counts = torch.zeros(self.num_experts, dtype=torch.float64, device=c.device)
+                self.counts += c
+                self.total_norm += float(out[0].detach().float().norm())
+            except Exception:
+                pass
+
+        def _shared_hook(self, module, inp, out):
+            try:
+                self.shared_norm += float(out.detach().float().norm())
+            except Exception:
+                pass
+
+        def on_train_begin(self, args, state, control, model=None, **kw):
+            if model is None:
+                return
+            for m in model.modules():
+                if hasattr(m, "moe_vectorized"):
+                    self._handles.append(m.register_forward_hook(self._moe_hook))
+                    if hasattr(m, "shared_experts"):
+                        self._handles.append(m.shared_experts.register_forward_hook(self._shared_hook))
+            log_info(f"[sn56][moe] utilization logging on ({len(self._handles)} hooks)")
+
+        def on_log(self, args, state, control, logs=None, **kw):
+            try:
+                import wandb
+            except Exception:
+                return
+            if self.counts is None or wandb.run is None:
+                return
+            counts = self.counts
+            total = counts.sum().clamp_min(1.0)
+            p = (counts / total).clamp_min(1e-12)
+            ent = float(-(p * p.log()).sum() / torch.log(torch.tensor(float(self.num_experts))))
+            metrics = {
+                "moe/dead_expert_frac": float((counts == 0).sum()) / self.num_experts,
+                "moe/load_cv": float(counts.std() / (counts.mean() + 1e-12)),
+                "moe/routing_entropy": ent,                       # 1.0 = uniform routing
+                "moe/max_expert_load": float(counts.max() / total),
+                "moe/shared_expert_share": self.shared_norm / (self.total_norm + 1e-12),
+            }
+            self._log_calls += 1
+            if self._log_calls % max(1, self.hist_every) == 0:
+                try:
+                    metrics["moe/expert_load_hist"] = wandb.Histogram(
+                        sequence=(counts / total).cpu().tolist())
+                except Exception:
+                    pass
+            try:
+                wandb.log(metrics, step=state.global_step)
+            except Exception:
+                pass
+            self.counts = None
+            self.shared_norm = 0.0
+            self.total_norm = 0.0
+
+        def on_train_end(self, args, state, control, **kw):
+            for h in self._handles:
+                try:
+                    h.remove()
+                except Exception:
+                    pass
+
     _trainer_kwargs = dict(
         model=model,
         processing_class=tokenizer,  # transformers 5.x renamed Trainer(tokenizer=) -> processing_class
         args=training_args,
         train_dataset=train_ds,
         eval_dataset=dev_ds,
+        data_collator=(_quasar_pad_collator if is_quasar else None),
         callbacks=[
+            # Early fail-check: ONE forced save at step 10 (only when SAVE_SMOKE=1).
+            # All ranks (control flag must agree across DDP).
+            *([_EarlyFailSaveCB()] if os.environ.get("SAVE_SMOKE") == "1" else []),
+            # MoE utilization -> wandb (rank-0, env MOE_LOG=0 to disable).
+            *([_MoEUtilCB(getattr(getattr(model, "config", None), "num_experts", 256))]
+              if (is_quasar and is_main_process(LOCAL_RANK)
+                  and os.environ.get("MOE_LOG", "1") != "0") else []),
+            # Rank-0 only: under DDP both ranks would otherwise race the HF upload
+            # (duplicate/conflicting commits) and double-log throughput. Trainer writes
+            # the checkpoint on the main process, so rank 0 is exactly where on_save sees it.
+            *([_ThroughputCB()] if (is_quasar and is_main_process(LOCAL_RANK)) else []),
             *([] if ckpt_avg is None else [ckpt_avg]),
+            # HF upload AFTER ckpt_avg: ckpt_avg.on_save rewrites checkpoint-N in place
+            # with the souped/averaged best weights (when an avg is the current best), so
+            # uploading after it pushes the SOUP — not the raw step weights — to HF.
+            # Kept before CustomEvalSaveCallback so the checkpoint dir is still present.
+            *([_HFCkptUpload()] if is_main_process(LOCAL_RANK) else []),
             CustomEvalSaveCallback(
                 when_to_eval_handler,
                 train_request["submission_dir"],
@@ -620,6 +865,12 @@ def main():
         log_info(f"[sn56][farejando] Usando LR cached de tentativa anterior: {_cached_lr:.2e}")
     elif _use_deepspeed:
         log_info(f"[sn56][farejando] Pulando (DeepSpeed ativo)")
+    elif is_quasar:
+        # Bypass the (slow, hours-long) empirical LR search for Quasar in this branch —
+        # it consistently lands ~1.6e-4 (S1 best: lr=1.60e-04, loss=1.16). Force it so we
+        # go straight to training. Remove this branch to bring the live search back.
+        training_args.learning_rate = 1.6e-4
+        log_info(f"[sn56][farejando] BYPASS p/ Quasar — lr fixo={training_args.learning_rate:.2e} (melhor S1 da busca)")
     else:
         if torch.cuda.is_available():
             device = torch.device(f"cuda:{LOCAL_RANK}")
@@ -637,6 +888,21 @@ def main():
             return trainer.get_train_dataloader()
 
         original_bs = training_args.per_device_train_batch_size
+        # Run the search with the SAME optimizer as training. lr_search defaults to
+        # fp32 AdamW, whose m+v states are 4x the 8-bit paged optimizer training uses
+        # (~144GB vs ~36GB for 18B trainable) — that 4x is exactly what OOMs the search
+        # at bs=4 and forces the throughput-killing batch halving. Matching it also
+        # calibrates the found LR on the real optimizer. (None -> lr_search's default.)
+        _search_opt_cls, _search_opt_kwargs = None, None
+        if "8bit" in (getattr(training_args, "optim", "") or "").lower():
+            try:
+                import bitsandbytes as _bnb
+                _search_opt_cls = (_bnb.optim.PagedAdamW8bit if "paged" in training_args.optim.lower()
+                                   else _bnb.optim.AdamW8bit)
+                _search_opt_kwargs = {"weight_decay": training_args.weight_decay}
+                log_info(f"[sn56][farejando] busca usa optim de treino: {_search_opt_cls.__name__} (evita OOM do AdamW fp32)")
+            except Exception as _e:
+                log_info(f"[sn56][farejando] optim 8-bit p/ busca indisponivel ({_e}); AdamW fp32 padrao")
         best_lr, t_per_step = run_lr_search(
             model=model,
             train_dataloader=search_loader,
@@ -646,6 +912,8 @@ def main():
             max_grad_norm=training_args.max_grad_norm,
             dataloader_factory=_halve_batch_dataloader,
             steps_per_epoch=_steps_per_epoch,
+            optimizer_cls=_search_opt_cls,
+            optimizer_kwargs=_search_opt_kwargs,
         )
 
         # Sync batch size across ranks: if ANY rank halved its batch on OOM
