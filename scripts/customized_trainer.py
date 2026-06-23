@@ -239,7 +239,10 @@ class CustomEvalSaveCallback(TrainerCallback):
                 when_to_eval["reason"] != "end_time"
                 and args.num_train_epochs > 1
                 and state.global_step < int(0.75 * steps_per_epoch)
+                and os.environ.get("EVAL_FROM_START") != "1"
             ):
+                # EVAL_FROM_START=1 (Quasar warm-start runs) disables this skip so
+                # eval/save/soup-pool admission begin from step 0 instead of 0.75 epoch.
                 control.should_evaluate = False
                 control.should_save = False
 

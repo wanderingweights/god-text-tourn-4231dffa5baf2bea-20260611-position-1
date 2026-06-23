@@ -865,10 +865,12 @@ def main():
         log_info(f"[sn56][farejando] Usando LR cached de tentativa anterior: {_cached_lr:.2e}")
     elif _use_deepspeed:
         log_info(f"[sn56][farejando] Pulando (DeepSpeed ativo)")
-    elif is_quasar:
-        # Bypass the (slow, hours-long) empirical LR search for Quasar in this branch —
-        # it consistently lands ~1.6e-4 (S1 best: lr=1.60e-04, loss=1.16). Force it so we
-        # go straight to training. Remove this branch to bring the live search back.
+    elif is_quasar and os.environ.get("LR_FINDER") != "1":
+        # Bypass the (slow, hours-long) empirical LR search for Quasar from BASE — it
+        # consistently lands ~1.6e-4 (S1 best: lr=1.60e-04, loss=1.16). For a WARM START
+        # (continuing from a saved checkpoint) set LR_FINDER=1: this branch is skipped and
+        # we fall through to the live search (the right LR differs from base — usually
+        # lower). The search uses the 8-bit optimizer (OOM fix) in the else branch below.
         training_args.learning_rate = 1.6e-4
         log_info(f"[sn56][farejando] BYPASS p/ Quasar — lr fixo={training_args.learning_rate:.2e} (melhor S1 da busca)")
     else:
