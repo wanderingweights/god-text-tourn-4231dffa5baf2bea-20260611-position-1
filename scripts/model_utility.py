@@ -28,7 +28,7 @@ hf_api = HfApi()
 
 def get_model_architecture(model_path: str) -> str:
     try:
-        config = AutoConfig.from_pretrained(model_path)
+        config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
         architectures = config.architectures
         if len(architectures) > 1:
             return "Multiple architectures"
