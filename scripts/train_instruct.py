@@ -866,13 +866,13 @@ def main():
     elif _use_deepspeed:
         log_info(f"[sn56][farejando] Pulando (DeepSpeed ativo)")
     elif is_quasar and os.environ.get("LR_FINDER") != "1":
-        # Bypass the (slow, hours-long) empirical LR search for Quasar from BASE — it
-        # consistently lands ~1.6e-4 (S1 best: lr=1.60e-04, loss=1.16). For a WARM START
-        # (continuing from a saved checkpoint) set LR_FINDER=1: this branch is skipped and
-        # we fall through to the live search (the right LR differs from base — usually
-        # lower). The search uses the 8-bit optimizer (OOM fix) in the else branch below.
-        training_args.learning_rate = 1.6e-4
-        log_info(f"[sn56][farejando] BYPASS p/ Quasar — lr fixo={training_args.learning_rate:.2e} (melhor S1 da busca)")
+        # Bypass the (slow, ~3h) empirical LR search. Default to the base S1 best 1.6e-4,
+        # but allow an explicit fixed LR via QUASAR_LR — e.g. reuse a finder result from a
+        # prior warm-start run instead of paying for the search again. Set LR_FINDER=1 to
+        # run the live search instead (falls through to the 8-bit-optimizer search below).
+        # warmup + cosine scheduler still apply on top of this peak LR.
+        training_args.learning_rate = float(os.environ.get("QUASAR_LR", "1.6e-4"))
+        log_info(f"[sn56][farejando] BYPASS p/ Quasar — lr fixo={training_args.learning_rate:.2e}")
     else:
         if torch.cuda.is_available():
             device = torch.device(f"cuda:{LOCAL_RANK}")
